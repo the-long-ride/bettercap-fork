@@ -4,7 +4,7 @@ on:
   push:
     tags:
       - 'v*.*.*'    # Match version tags
-  workflow_dispatch:      
+  workflow_dispatch:
 
 jobs:
   build:
@@ -49,41 +49,114 @@ jobs:
       with:
         go-version: ${{ matrix.go }}
 
-    - name: Install Dependencies
+    - name: Install Dependencies (Linux)
       if: ${{ matrix.os.name == 'linux' }}
       run: sudo apt-get update && sudo apt-get install -y p7zip-full libpcap-dev libnetfilter-queue-dev libusb-1.0-0-dev
 
     - name: Install Dependencies (macOS)
-      if: ${{ matrix.os.name == 'macos' }}
+      if: ${{ matrix.os.name == 'darwin' }}
       run: brew install libpcap libusb p7zip
 
-    - name: Install libusb via mingw (Windows)
+    - name: Install MinGW x64 dependencies (Windows)
       if: ${{ matrix.os.name == 'windows' }}
       uses: msys2/setup-msys2@v2
       with:
         install: |-
+          mingw64/mingw-w64-x86_64-gcc
           mingw64/mingw-w64-x86_64-libusb
           mingw64/mingw-w64-x86_64-pkg-config
 
-    - name: Install other Dependencies (Windows)
+    - name: Install build dependencies (Windows)
       if: ${{ matrix.os.name == 'windows' }}
+      shell: pwsh
       run: |
-        choco install openssl.light -y
-        choco install make -y
-        choco install 7zip -y
-        choco install zadig -y
-        curl -L "https://www.winpcap.org/install/bin/WpdPack_4_1_2.zip" -o "C:\wpcap-sdk.zip"
-        7z x -y "C:\wpcap-sdk.zip" -o"C:\winpcap"
-        echo "D:\a\_temp\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        choco install make -y --no-progress
+        choco install 7zip -y --no-progress
+
+        curl.exe -L "https://www.winpcap.org/install/bin/WpdPack_4_1_2.zip" -o "$env:RUNNER_TEMP\wpcap-sdk.zip"
+        7z x -y "$env:RUNNER_TEMP\wpcap-sdk.zip" "-oC:\winpcap"
+
+        "$env:RUNNER_TEMP\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        "CGO_ENABLED=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "CGO_CFLAGS=-IC:/winpcap/WpdPack/Include" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "CGO_LDFLAGS=-LC:/winpcap/WpdPack/Lib/x64 -lwpcap" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
     - name: Build
       run: make -e TARGET="${{ env.OUTPUT }}"
 
-    - name: Verify Build
+    - name: Verify and package build (Linux/macOS)
+      if: ${{ matrix.os.name != 'windows' }}
       run: |
         file "${{ env.OUTPUT }}"
         openssl dgst -sha256 "${{ env.OUTPUT }}" | tee bettercap_${{ matrix.os.name }}_${{ matrix.arch }}.sha256
         7z a "bettercap_${{ matrix.os.name }}_${{ matrix.arch }}.zip" "${{ env.OUTPUT }}" "bettercap_${{ matrix.os.name }}_${{ matrix.arch }}.sha256"
+
+    - name: Bundle runtime dependencies and package build (Windows)
+      if: ${{ matrix.os.name == 'windows' }}
+      shell: pwsh
+      run: |
+        if (-not (Test-Path "${{ env.OUTPUT }}")) {
+          throw "${{ env.OUTPUT }} was not produced"
+        }
+
+        $mingwBin = Join-Path $env:RUNNER_TEMP "msys64\mingw64\bin"
+        $objdump = Join-Path $mingwBin "objdump.exe"
+        $dist = Join-Path $PWD "dist"
+
+        if (-not (Test-Path $objdump)) {
+          throw "MinGW objdump.exe was not found at $objdump"
+        }
+
+        New-Item -ItemType Directory -Force -Path $dist | Out-Null
+        Copy-Item "${{ env.OUTPUT }}" (Join-Path $dist "bettercap.exe") -Force
+
+        # Recursively bundle MinGW/MSYS2-provided DLLs required by the EXE and by
+        # other bundled DLLs. Windows system DLLs and WinPcap/Npcap are not copied.
+        $queue = [System.Collections.Generic.Queue[string]]::new()
+        $queue.Enqueue((Join-Path $dist "bettercap.exe"))
+        $seen = @{}
+
+        while ($queue.Count -gt 0) {
+          $binary = $queue.Dequeue()
+          $dependencies = & $objdump -p $binary 2>$null |
+            Select-String "DLL Name:" |
+            ForEach-Object { ($_ -replace '^.*DLL Name:\s*', '').Trim() }
+
+          foreach ($dll in $dependencies) {
+            $key = $dll.ToLowerInvariant()
+            if ($seen.ContainsKey($key)) {
+              continue
+            }
+            $seen[$key] = $true
+
+            $source = Join-Path $mingwBin $dll
+            if (Test-Path $source) {
+              $target = Join-Path $dist $dll
+              Copy-Item $source $target -Force
+              $queue.Enqueue($target)
+              Write-Host "Bundled runtime dependency: $dll"
+            }
+          }
+        }
+
+        $libusb = Join-Path $dist "libusb-1.0.dll"
+        if (-not (Test-Path $libusb)) {
+          throw "libusb-1.0.dll was not bundled; refusing to publish a broken Windows artifact"
+        }
+
+        $checksumFile = "bettercap_windows_amd64.sha256"
+        $checksums = Get-ChildItem $dist -File | Sort-Object Name | ForEach-Object {
+          $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($_.Name)"
+        }
+        $checksums | Set-Content -Path $checksumFile -Encoding ascii
+        Copy-Item $checksumFile (Join-Path $dist "SHA256SUMS.txt") -Force
+
+        Compress-Archive -Path (Join-Path $dist "*") -DestinationPath "bettercap_windows_amd64.zip" -Force
+
+        Write-Host "Packaged Windows files:"
+        Get-ChildItem $dist -File | Sort-Object Name | Format-Table Name, Length
+        Get-Content $checksumFile
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v7
@@ -92,6 +165,7 @@ jobs:
         path: |
           bettercap_*.zip
           bettercap_*.sha256
+        if-no-files-found: error
 
   deploy:
     needs: [build]
