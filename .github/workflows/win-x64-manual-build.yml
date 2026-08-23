@@ -60,22 +60,73 @@ jobs:
         shell: pwsh
         run: make -e TARGET="bettercap.exe"
 
-      - name: Verify and package artifact
+      - name: Bundle runtime dependencies and package artifact
         shell: pwsh
         run: |
           if (-not (Test-Path "bettercap.exe")) {
             throw "bettercap.exe was not produced"
           }
 
-          $hash = (Get-FileHash "bettercap.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  bettercap.exe" | Set-Content -Path "bettercap_windows_amd64.sha256" -Encoding ascii
+          $mingwBin = Join-Path $env:RUNNER_TEMP "msys64\mingw64\bin"
+          $objdump = Join-Path $mingwBin "objdump.exe"
+          $dist = Join-Path $PWD "dist"
 
-          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
-          Copy-Item "bettercap.exe" "dist\bettercap.exe"
-          Copy-Item "bettercap_windows_amd64.sha256" "dist\bettercap_windows_amd64.sha256"
-          Compress-Archive -Path "dist\bettercap.exe", "dist\bettercap_windows_amd64.sha256" -DestinationPath "bettercap_windows_amd64.zip" -Force
+          if (-not (Test-Path $objdump)) {
+            throw "MinGW objdump.exe was not found at $objdump"
+          }
 
-          Get-Item "bettercap.exe" | Format-List Name,Length,LastWriteTime
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "bettercap.exe" (Join-Path $dist "bettercap.exe") -Force
+
+          # Recursively bundle DLLs supplied by the MinGW/MSYS2 toolchain.
+          # Windows system DLLs and WinPcap/Npcap DLLs are intentionally not copied.
+          $queue = [System.Collections.Generic.Queue[string]]::new()
+          $queue.Enqueue((Join-Path $dist "bettercap.exe"))
+          $seen = @{}
+
+          while ($queue.Count -gt 0) {
+            $binary = $queue.Dequeue()
+            $dependencies = & $objdump -p $binary 2>$null |
+              Select-String "DLL Name:" |
+              ForEach-Object { ($_ -replace '^.*DLL Name:\s*', '').Trim() }
+
+            foreach ($dll in $dependencies) {
+              $key = $dll.ToLowerInvariant()
+              if ($seen.ContainsKey($key)) {
+                continue
+              }
+              $seen[$key] = $true
+
+              $source = Join-Path $mingwBin $dll
+              if (Test-Path $source) {
+                $target = Join-Path $dist $dll
+                Copy-Item $source $target -Force
+                $queue.Enqueue($target)
+                Write-Host "Bundled runtime dependency: $dll"
+              }
+            }
+          }
+
+          $libusb = Join-Path $dist "libusb-1.0.dll"
+          if (-not (Test-Path $libusb)) {
+            throw "libusb-1.0.dll was not bundled; the generated executable would fail on a clean Windows machine"
+          }
+
+          Write-Host "Packaged files:"
+          Get-ChildItem $dist -File | Sort-Object Name | Format-Table Name, Length
+
+          $checksums = Get-ChildItem $dist -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+          $checksums | Set-Content -Path "bettercap_windows_amd64.sha256" -Encoding ascii
+          Copy-Item "bettercap_windows_amd64.sha256" (Join-Path $dist "SHA256SUMS.txt") -Force
+
+          Compress-Archive -Path (Join-Path $dist "*") -DestinationPath "bettercap_windows_amd64.zip" -Force
+
+          Write-Host "Runtime dependencies of bettercap.exe:"
+          & $objdump -p (Join-Path $dist "bettercap.exe") |
+            Select-String "DLL Name:"
           Get-Content "bettercap_windows_amd64.sha256"
 
       - name: Upload Windows x64 artifact
