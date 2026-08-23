@@ -1,0 +1,88 @@
+name: Manual Windows x64 Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-win-x64:
+    name: Windows x64 (Intel/AMD)
+    runs-on: windows-latest
+
+    env:
+      GO111MODULE: "on"
+      GOOS: windows
+      GOARCH: amd64
+      CGO_ENABLED: "1"
+      CGO_CFLAGS: -IC:/winpcap/WpdPack/Include
+      CGO_LDFLAGS: -LC:/winpcap/WpdPack/Lib/x64 -lwpcap
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.x
+          cache: true
+
+      - name: Install MinGW x64 dependencies
+        uses: msys2/setup-msys2@v2
+        with:
+          install: |-
+            mingw64/mingw-w64-x86_64-gcc
+            mingw64/mingw-w64-x86_64-libusb
+            mingw64/mingw-w64-x86_64-pkg-config
+
+      - name: Install Windows build dependencies
+        shell: pwsh
+        run: |
+          choco install make -y --no-progress
+          choco install 7zip -y --no-progress
+
+          curl.exe -L "https://www.winpcap.org/install/bin/WpdPack_4_1_2.zip" -o "$env:RUNNER_TEMP\wpcap-sdk.zip"
+          7z x -y "$env:RUNNER_TEMP\wpcap-sdk.zip" "-oC:\winpcap"
+
+          "$env:RUNNER_TEMP\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Verify x64 toolchain
+        shell: pwsh
+        run: |
+          go version
+          gcc --version
+          pkg-config --modversion libusb-1.0
+          Write-Host "GOOS=$env:GOOS GOARCH=$env:GOARCH CGO_ENABLED=$env:CGO_ENABLED"
+
+      - name: Build bettercap.exe
+        shell: pwsh
+        run: make -e TARGET="bettercap.exe"
+
+      - name: Verify and package artifact
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "bettercap.exe")) {
+            throw "bettercap.exe was not produced"
+          }
+
+          $hash = (Get-FileHash "bettercap.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  bettercap.exe" | Set-Content -Path "bettercap_windows_amd64.sha256" -Encoding ascii
+
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          Copy-Item "bettercap.exe" "dist\bettercap.exe"
+          Copy-Item "bettercap_windows_amd64.sha256" "dist\bettercap_windows_amd64.sha256"
+          Compress-Archive -Path "dist\bettercap.exe", "dist\bettercap_windows_amd64.sha256" -DestinationPath "bettercap_windows_amd64.zip" -Force
+
+          Get-Item "bettercap.exe" | Format-List Name,Length,LastWriteTime
+          Get-Content "bettercap_windows_amd64.sha256"
+
+      - name: Upload Windows x64 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: bettercap-windows-amd64-${{ github.run_number }}
+          path: |
+            bettercap_windows_amd64.zip
+            bettercap_windows_amd64.sha256
+          if-no-files-found: error
