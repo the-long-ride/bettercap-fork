@@ -2,6 +2,11 @@ name: Manual Windows x64 Build
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/win-x64-manual-build.yml"
+      - ".github/workflows/build-and-deploy.yml"
 
 permissions:
   contents: read
